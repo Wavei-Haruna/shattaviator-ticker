@@ -1,4 +1,4 @@
-import { tick } from './round-manager'
+import { tick } from './round-manager.js'
 
 const TICK_MS = 250
 

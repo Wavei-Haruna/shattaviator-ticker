@@ -10,8 +10,8 @@
 // shared bits (RoundDoc shape, currentMultiplier, growth constants).
 
 import { Firestore } from 'firebase-admin/firestore'
-import { computeCrashPoint, generateRoundSeed, RoundSeed } from './crash'
-import { adminDb } from './firebase-admin'
+import { computeCrashPoint, generateRoundSeed, RoundSeed } from './crash.js'
+import { adminDb } from './firebase-admin.js'
 
 type Phase = 'waiting' | 'running' | 'crashed'
 
