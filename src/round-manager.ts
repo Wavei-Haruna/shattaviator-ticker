@@ -8,10 +8,18 @@
 // and the Vercel copy as authoritative for the read-only functions
 // (getPublicState/placeBet/cashOut) -- keep them in sync if you touch the
 // shared bits (RoundDoc shape, currentMultiplier, growth constants).
+//
+// NEW: this copy also owns broadcasting. It builds the same JSON shape
+// Vercel's getPublicState() returns and pushes it over the WS server
+// (lib/game/ws-server.ts) on every phase transition, plus a throttled
+// once/sec push during 'waiting' so the client's countdown doesn't freeze
+// (the countdown, unlike the running multiplier, isn't recomputed locally
+// on the client -- see buildStatePayload's history/countdown notes below).
 
 import { Firestore } from 'firebase-admin/firestore'
 import { computeCrashPoint, generateRoundSeed, RoundSeed } from './crash.js'
 import { adminDb } from './firebase-admin.js'
+import { broadcastState } from './ws-server.js'
 
 type Phase = 'waiting' | 'running' | 'crashed'
 
@@ -22,6 +30,11 @@ interface Bet {
   autoCashoutAt: number | null
   cashedOutAt: number | null
   payout: number | null
+}
+
+interface RoundHistoryEntry {
+  roundNumber: number
+  crashPoint: number
 }
 
 interface RoundDoc {
@@ -43,6 +56,13 @@ const CRASHED_DISPLAY_MS = 3_000
 const GROWTH_BASE_PER_MS = 0.00016
 const GROWTH_ACCEL_PER_MS2 = 0.0000000075
 
+const MAX_HISTORY = 50
+
+// How often to re-broadcast during 'waiting' just to keep the countdown
+// moving. Transitions always broadcast regardless of this.
+const WAITING_BROADCAST_INTERVAL_MS = 1_000
+let lastWaitingBroadcastAt = 0
+
 const db: Firestore = adminDb
 const roundsCol = db.collection('rounds')
 const metaDoc = db.collection('meta').doc('currentRound')
@@ -54,6 +74,14 @@ function currentMultiplier(round: RoundDoc, now: number): number {
   const elapsed = now - (round.startedAt ?? now)
   const exponent = GROWTH_BASE_PER_MS * elapsed + GROWTH_ACCEL_PER_MS2 * elapsed * elapsed
   return Math.min(Math.exp(exponent), round.crashPoint)
+}
+
+// Duplicated from the Vercel copy -- only used here to color history
+// chips in the broadcast payload. Keep in sync if you change the tiers.
+function multiplierColor(value: number): 'blue' | 'purple' | 'pink' {
+  if (value >= 10) return 'pink'
+  if (value >= 2) return 'purple'
+  return 'blue'
 }
 
 async function ensureCurrentRound(): Promise<string> {
@@ -84,6 +112,43 @@ async function ensureCurrentRound(): Promise<string> {
   })
 }
 
+// Builds the exact same shape Vercel's getPublicState() returns, so the
+// client's `msg.<field>` reads (in useGameSocket) line up regardless of
+// whether the client polled Vercel or got pushed this over the socket.
+async function buildStatePayload(round: RoundDoc) {
+  const now = Date.now()
+  const historySnap = await roundsCol
+    .where('phase', '==', 'crashed')
+    .orderBy('roundNumber', 'desc')
+    .limit(MAX_HISTORY)
+    .get()
+  const history: RoundHistoryEntry[] = historySnap.docs.map((d) => {
+    const data = d.data() as RoundDoc
+    return { roundNumber: data.roundNumber, crashPoint: data.crashPoint }
+  })
+
+  return {
+    phase: round.phase,
+    roundNumber: round.roundNumber,
+    serverSeedHash: round.seed.serverSeedHash,
+    multiplier: Number(currentMultiplier(round, now).toFixed(2)),
+    startedAt: round.phase === 'running' ? round.startedAt : null,
+    serverTime: now,
+    startsInMs: round.phase === 'waiting' ? Math.max(0, (round.nextRoundAt ?? now) - now) : null,
+    revealedSeed: round.phase === 'crashed' ? round.seed.serverSeed : null,
+    crashPoint: round.phase === 'crashed' ? round.crashPoint : null,
+    history: history.map((h) => ({
+      roundNumber: h.roundNumber,
+      value: h.crashPoint,
+      color: multiplierColor(h.crashPoint),
+    })),
+  }
+}
+
+async function broadcast(round: RoundDoc) {
+  broadcastState(await buildStatePayload(round))
+}
+
 // The only writer to round-phase state in the whole system. Called every
 // TICK_MS from index.ts's setInterval loop.
 export async function tick(): Promise<RoundDoc> {
@@ -102,6 +167,7 @@ export async function tick(): Promise<RoundDoc> {
     })
     snap = await roundRef.get()
     round = snap.data() as RoundDoc
+    await broadcast(round) // transition: waiting -> running
   }
 
   if (round.phase === 'running') {
@@ -116,6 +182,7 @@ export async function tick(): Promise<RoundDoc> {
       })
       snap = await roundRef.get()
       round = snap.data() as RoundDoc
+      await broadcast(round) // transition: running -> crashed
     }
   }
 
@@ -148,6 +215,14 @@ export async function tick(): Promise<RoundDoc> {
     roundRef = roundsCol.doc(newRoundId)
     snap = await roundRef.get()
     round = snap.data() as RoundDoc
+    lastWaitingBroadcastAt = Date.now()
+    await broadcast(round) // transition: crashed -> waiting (new round)
+  } else if (round.phase === 'waiting' && Date.now() - lastWaitingBroadcastAt >= WAITING_BROADCAST_INTERVAL_MS) {
+    // Not a phase transition -- just keeps the "next round in Xs"
+    // countdown moving on the client, since (unlike the running
+    // multiplier) it isn't recomputed locally between pushes.
+    lastWaitingBroadcastAt = Date.now()
+    await broadcast(round)
   }
 
   return round
