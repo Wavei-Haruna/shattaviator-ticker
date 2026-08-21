@@ -1,12 +1,12 @@
 // This is a copy of lib/game/round-manager.ts from the main Vercel app.
 // It needs to live here too because this is a separate deployed service
-// (Railway) with its own dependency tree — it can't import across repos.
+// (Railway) with its own dependency tree -- it can't import across repos.
 //
 // If you keep both projects in one monorepo, you can skip the
 // duplication by making this a shared workspace package instead. For
 // now, treat this file as authoritative for tick()/resolveAutoCashouts()
 // and the Vercel copy as authoritative for the read-only functions
-// (getPublicState/placeBet/cashOut) — keep them in sync if you touch the
+// (getPublicState/placeBet/cashOut) -- keep them in sync if you touch the
 // shared bits (RoundDoc shape, currentMultiplier, growth constants).
 
 import { Firestore } from 'firebase-admin/firestore'
@@ -37,7 +37,7 @@ interface RoundDoc {
 const WAITING_MS = 5_000
 const CRASHED_DISPLAY_MS = 3_000
 
-// Keep these in sync with the Vercel copy — they determine the growth
+// Keep these in sync with the Vercel copy -- they determine the growth
 // curve, and a mismatch would mean the ticker crashes rounds at a
 // different rate than the client's own multiplier display expects.
 const GROWTH_BASE_PER_MS = 0.00016
