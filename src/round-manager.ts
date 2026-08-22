@@ -47,7 +47,7 @@ interface RoundDoc {
   createdAt: number
 }
 
-const WAITING_MS = 5_000
+const WAITING_MS = 8_000
 const CRASHED_DISPLAY_MS = 3_000
 
 // Keep these in sync with the Vercel copy AND with the client's
