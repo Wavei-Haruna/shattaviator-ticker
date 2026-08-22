@@ -50,11 +50,17 @@ interface RoundDoc {
 const WAITING_MS = 5_000
 const CRASHED_DISPLAY_MS = 3_000
 
-// Keep these in sync with the Vercel copy -- they determine the growth
-// curve, and a mismatch would mean the ticker crashes rounds at a
-// different rate than the client's own multiplier display expects.
-const GROWTH_BASE_PER_MS = 0.00016
-const GROWTH_ACCEL_PER_MS2 = 0.0000000075
+// Keep these in sync with the Vercel copy AND with the client's
+// use-game-socket.ts -- they determine the growth curve, and a mismatch
+// would mean the ticker crashes rounds at a different rate than the
+// client's own multiplier display expects (or, worse, lets a client-side
+// display disagree with what a bet actually resolved against).
+//
+// Halved from the original (0.00016 / 0.0000000075) on 2026-08-22 to
+// slow the climb down. If you tune these again, update all three
+// locations: this file, the Vercel copy, and use-game-socket.ts.
+const GROWTH_BASE_PER_MS = 0.00008
+const GROWTH_ACCEL_PER_MS2 = 0.00000000375
 
 const MAX_HISTORY = 50
 
