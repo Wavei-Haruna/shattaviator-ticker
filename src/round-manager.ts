@@ -150,6 +150,42 @@ async function refreshHistoryCache(): Promise<void> {
   historyCacheLoaded = true
 }
 
+// In-memory copy of the current round, kept in sync with our own writes
+// instead of being re-read from Firestore every tick. This process is the
+// ONLY writer of round documents (see the file-level comment and the
+// single-instance assumption below), so once we've loaded a round, we
+// already know its true state -- re-fetching it every 250ms was pure
+// overhead, and on a slow Firestore round-trip that overhead is exactly
+// what delays crash detection.
+//
+// SAFETY REQUIREMENT: this is only correct if exactly ONE instance of
+// this ticker is running. Two instances would each keep a diverging
+// cache and could both "detect" and broadcast a crash independently, or
+// disagree about which round is current. If this service is ever scaled
+// to multiple replicas, this caching needs to be removed (or replaced
+// with a leader-election / locking scheme) before that happens.
+let cachedRound: RoundDoc | null = null
+let cachedRoundRef: FirebaseFirestore.DocumentReference | null = null
+
+// Periodic full resync as a cheap safety net against cache drift (a
+// manual Firestore edit, a process restart elsewhere, anything we didn't
+// anticipate) -- NOT required for correctness under the single-instance
+// assumption, just a self-healing backstop. Runs far less often than
+// every tick, so it doesn't reintroduce the per-tick latency we just
+// removed.
+const RESYNC_EVERY_N_TICKS = 40 // ~10s at TICK_MS=250
+let ticksSinceResync = 0
+
+async function loadRoundFromFirestore(): Promise<{ ref: FirebaseFirestore.DocumentReference; round: RoundDoc }> {
+  const roundId = await ensureCurrentRound()
+  const ref = roundsCol.doc(roundId)
+  const snap = await ref.get()
+  const round = snap.data() as RoundDoc
+  cachedRound = round
+  cachedRoundRef = ref
+  return { ref, round }
+}
+
 async function buildStatePayload(round: RoundDoc) {
   const now = Date.now()
   if (!historyCacheLoaded) {
@@ -181,68 +217,100 @@ async function broadcast(round: RoundDoc) {
 // The only writer to round-phase state in the whole system. Called every
 // TICK_MS from index.ts's setInterval loop.
 export async function tick(): Promise<RoundDoc> {
-  const roundId = await ensureCurrentRound()
-  let roundRef = roundsCol.doc(roundId)
-  let snap = await roundRef.get()
-  let round = snap.data() as RoundDoc
+  // Steady-state path: reuse the in-memory round instead of re-reading
+  // it from Firestore every 250ms (see the cachedRound comment above for
+  // why, and the single-instance requirement that makes it safe). Only
+  // hit Firestore for "what round are we in" on cold start or the
+  // periodic safety-net resync.
+  if (!cachedRound || !cachedRoundRef || ticksSinceResync >= RESYNC_EVERY_N_TICKS) {
+    await loadRoundFromFirestore()
+    ticksSinceResync = 0
+  } else {
+    ticksSinceResync++
+  }
+  let roundRef = cachedRoundRef!
+  let round = cachedRound!
   const now = Date.now()
 
   if (round.phase === 'waiting' && round.nextRoundAt !== null && now >= round.nextRoundAt) {
+    let transitioned = false
     await db.runTransaction(async (tx) => {
       const fresh = await tx.get(roundRef)
       const data = fresh.data() as RoundDoc
       if (data.phase !== 'waiting') return
       tx.update(roundRef, { phase: 'running', startedAt: now, nextRoundAt: null })
+      transitioned = true
     })
-    snap = await roundRef.get()
-    round = snap.data() as RoundDoc
-    await broadcast(round) // transition: waiting -> running
+    if (transitioned) {
+      // We know exactly what we just wrote -- no need to read it back.
+      round = { ...round, phase: 'running', startedAt: now, nextRoundAt: null }
+      cachedRound = round
+      await broadcast(round) // transition: waiting -> running
+    } else {
+      // Guard's `if (data.phase !== 'waiting') return` fired, meaning our
+      // cache disagreed with Firestore. Shouldn't happen under the
+      // single-instance assumption -- resync and carry on defensively.
+      const resynced = await loadRoundFromFirestore()
+      round = resynced.round
+      roundRef = resynced.ref
+    }
   }
 
   if (round.phase === 'running') {
     // Crash check happens FIRST and off the already-in-memory `round` --
-    // no extra Firestore round-trip before it. Previously
-    // resolveAutoCashouts() (a query + batch write) ran ahead of this
-    // check every single tick, so crash detection/broadcast sat behind
-    // an extra round-trip on every tick even when nothing was due to
-    // auto-cash-out. That delay is exactly what showed up as the client
-    // overshooting the real crash point before the reveal arrived. There
-    // is deliberately NO periodic re-broadcast during 'running' beyond
-    // this -- see the historyCache comment above for why an earlier
-    // attempt at that made things worse instead of better.
+    // no Firestore round-trip before it at all now, not even a read.
+    // Previously resolveAutoCashouts() (a query + batch write) ran ahead
+    // of this check every single tick, so crash detection/broadcast sat
+    // behind an extra round-trip on every tick even when nothing was due
+    // to auto-cash-out. That delay is exactly what showed up as the
+    // client overshooting the real crash point before the reveal
+    // arrived. There is deliberately NO periodic re-broadcast during
+    // 'running' beyond this -- see the historyCache comment above for
+    // why an earlier attempt at that made things worse instead of better.
     const liveNow = Date.now()
     if (currentMultiplier(round, liveNow) >= round.crashPoint) {
       const crashedAt = Date.now()
+      let transitioned = false
       await db.runTransaction(async (tx) => {
         const fresh = await tx.get(roundRef)
         const data = fresh.data() as RoundDoc
         if (data.phase !== 'running') return
         tx.update(roundRef, { phase: 'crashed', nextRoundAt: crashedAt + CRASHED_DISPLAY_MS })
+        transitioned = true
       })
-      snap = await roundRef.get()
-      round = snap.data() as RoundDoc
-      await refreshHistoryCache() // this round just became a new history entry
-      await broadcast(round) // transition: running -> crashed -- fire this immediately;
-      // any bets that auto-cashed-out exactly at/before the crash still
-      // get resolved correctly since resolveAutoCashouts is capped by
-      // the same round.crashPoint via currentMultiplier()'s own Math.min.
-      await resolveAutoCashouts(roundRef, round, crashedAt)
+      if (transitioned) {
+        round = { ...round, phase: 'crashed', nextRoundAt: crashedAt + CRASHED_DISPLAY_MS }
+        cachedRound = round
+        await refreshHistoryCache() // this round just became a new history entry
+        await broadcast(round) // transition: running -> crashed -- fire this immediately;
+        // any bets that auto-cashed-out exactly at/before the crash still
+        // get resolved correctly since resolveAutoCashouts is capped by
+        // the same round.crashPoint via currentMultiplier()'s own Math.min.
+        await resolveAutoCashouts(roundRef, round, crashedAt)
+      } else {
+        const resynced = await loadRoundFromFirestore()
+        round = resynced.round
+        roundRef = resynced.ref
+      }
     } else {
       await resolveAutoCashouts(roundRef, round, liveNow)
     }
   }
 
   if (round.phase === 'crashed' && round.nextRoundAt !== null && Date.now() >= round.nextRoundAt) {
-    const newRoundId = await db.runTransaction(async (tx) => {
+    const start = Date.now()
+    let newRoundId: string | null = null
+    let newDoc: RoundDoc | null = null
+    await db.runTransaction(async (tx) => {
       const metaSnap = await tx.get(metaDoc)
-      if (metaSnap.data()!.roundId !== roundId) {
-        return metaSnap.data()!.roundId as string
+      if (metaSnap.data()!.roundId !== roundRef.id) {
+        // Someone/something else already advanced the round -- resync below.
+        return
       }
       const counterSnap = await tx.get(counterDoc)
       const nextNumber = (counterSnap.data()!.value as number) + 1
       const seed = generateRoundSeed(nextNumber)
       const crashPoint = computeCrashPoint(seed)
-      const start = Date.now()
       const newRef = roundsCol.doc(String(nextNumber))
       const doc: RoundDoc = {
         roundNumber: nextNumber,
@@ -256,13 +324,21 @@ export async function tick(): Promise<RoundDoc> {
       tx.set(newRef, doc)
       tx.set(counterDoc, { value: nextNumber })
       tx.set(metaDoc, { roundId: newRef.id })
-      return newRef.id
+      newRoundId = newRef.id
+      newDoc = doc
     })
-    roundRef = roundsCol.doc(newRoundId)
-    snap = await roundRef.get()
-    round = snap.data() as RoundDoc
-    lastWaitingBroadcastAt = Date.now()
-    await broadcast(round) // transition: crashed -> waiting (new round)
+    if (newRoundId && newDoc) {
+      roundRef = roundsCol.doc(newRoundId)
+      round = newDoc
+      cachedRound = round
+      cachedRoundRef = roundRef
+      lastWaitingBroadcastAt = Date.now()
+      await broadcast(round) // transition: crashed -> waiting (new round)
+    } else {
+      const resynced = await loadRoundFromFirestore()
+      round = resynced.round
+      roundRef = resynced.ref
+    }
   } else if (round.phase === 'waiting' && Date.now() - lastWaitingBroadcastAt >= WAITING_BROADCAST_INTERVAL_MS) {
     // Not a phase transition -- just keeps the "next round in Xs"
     // countdown moving on the client, since (unlike the running
