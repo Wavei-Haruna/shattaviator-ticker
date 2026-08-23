@@ -56,16 +56,12 @@ const CRASHED_DISPLAY_MS = 3_000
 // client's own multiplier display expects (or, worse, lets a client-side
 // display disagree with what a bet actually resolved against).
 //
-// GROWTH_ACCEL_PER_MS2 cut to 1/5 of the prior value (2026-08-22, same
-// day as the first halving). The quadratic term compounds on itself, so
-// at the old value the curve went from ~322x at 30s to the 1000x cap in
-// another ~3.6s -- fast enough that a cash-out's normal request latency
-// near a high multiplier could resolve several x away from what the
-// player saw on screen when they clicked. New timings: 2x ~8.1s,
-// 5x ~17.3s, 10x ~23.6s, 50x ~36.5s, 100x ~41.5s, 1000x cap ~56.5s.
-// If you tune these again, update all three locations: this file, the
-// Vercel copy, and use-game-socket.ts.
-const GROWTH_BASE_PER_MS = 0.00008
+// GROWTH_BASE_PER_MS cut by ~35% (2026-08-23) to slow the overall climb
+// further -- ACCEL left as-is since pacing above 10x was confirmed fine.
+// New timings: 2x ~11.4s, 5x ~23.2s, 10x ~30.7s, 50x ~45.5s, 100x ~51.0s,
+// 1000x cap ~67.4s. If you tune these again, update all three locations:
+// this file, the Vercel copy, and use-game-socket.ts.
+const GROWTH_BASE_PER_MS = 0.000052
 const GROWTH_ACCEL_PER_MS2 = 0.00000000075
 
 const MAX_HISTORY = 50
@@ -127,17 +123,38 @@ async function ensureCurrentRound(): Promise<string> {
 // Builds the exact same shape Vercel's getPublicState() returns, so the
 // client's `msg.<field>` reads (in useGameSocket) line up regardless of
 // whether the client polled Vercel or got pushed this over the socket.
-async function buildStatePayload(round: RoundDoc) {
-  const now = Date.now()
+//
+// History only ever gains a new entry the moment a round crashes -- it
+// cannot change at any other point. Previously this function queried
+// Firestore for the last 50 crashed rounds on EVERY call, including the
+// once/sec 'waiting' countdown keep-alive broadcast; that was already
+// wasteful, and became a real problem when a since-reverted change also
+// broadcast every 400ms during 'running' -- the extra query load slowed
+// the tick loop itself down, which delayed crash detection instead of
+// speeding it up. historyCache is refreshed only in the one place history
+// actually changes (right after a crash transition, in tick() below) and
+// reused everywhere else.
+let historyCache: RoundHistoryEntry[] = []
+let historyCacheLoaded = false
+
+async function refreshHistoryCache(): Promise<void> {
   const historySnap = await roundsCol
     .where('phase', '==', 'crashed')
     .orderBy('roundNumber', 'desc')
     .limit(MAX_HISTORY)
     .get()
-  const history: RoundHistoryEntry[] = historySnap.docs.map((d) => {
+  historyCache = historySnap.docs.map((d) => {
     const data = d.data() as RoundDoc
     return { roundNumber: data.roundNumber, crashPoint: data.crashPoint }
   })
+  historyCacheLoaded = true
+}
+
+async function buildStatePayload(round: RoundDoc) {
+  const now = Date.now()
+  if (!historyCacheLoaded) {
+    await refreshHistoryCache()
+  }
 
   return {
     phase: round.phase,
@@ -149,7 +166,7 @@ async function buildStatePayload(round: RoundDoc) {
     startsInMs: round.phase === 'waiting' ? Math.max(0, (round.nextRoundAt ?? now) - now) : null,
     revealedSeed: round.phase === 'crashed' ? round.seed.serverSeed : null,
     crashPoint: round.phase === 'crashed' ? round.crashPoint : null,
-    history: history.map((h) => ({
+    history: historyCache.map((h) => ({
       roundNumber: h.roundNumber,
       value: h.crashPoint,
       color: multiplierColor(h.crashPoint),
@@ -183,8 +200,18 @@ export async function tick(): Promise<RoundDoc> {
   }
 
   if (round.phase === 'running') {
-    await resolveAutoCashouts(roundRef, round, Date.now())
-    if (currentMultiplier(round, Date.now()) >= round.crashPoint) {
+    // Crash check happens FIRST and off the already-in-memory `round` --
+    // no extra Firestore round-trip before it. Previously
+    // resolveAutoCashouts() (a query + batch write) ran ahead of this
+    // check every single tick, so crash detection/broadcast sat behind
+    // an extra round-trip on every tick even when nothing was due to
+    // auto-cash-out. That delay is exactly what showed up as the client
+    // overshooting the real crash point before the reveal arrived. There
+    // is deliberately NO periodic re-broadcast during 'running' beyond
+    // this -- see the historyCache comment above for why an earlier
+    // attempt at that made things worse instead of better.
+    const liveNow = Date.now()
+    if (currentMultiplier(round, liveNow) >= round.crashPoint) {
       const crashedAt = Date.now()
       await db.runTransaction(async (tx) => {
         const fresh = await tx.get(roundRef)
@@ -194,7 +221,14 @@ export async function tick(): Promise<RoundDoc> {
       })
       snap = await roundRef.get()
       round = snap.data() as RoundDoc
-      await broadcast(round) // transition: running -> crashed
+      await refreshHistoryCache() // this round just became a new history entry
+      await broadcast(round) // transition: running -> crashed -- fire this immediately;
+      // any bets that auto-cashed-out exactly at/before the crash still
+      // get resolved correctly since resolveAutoCashouts is capped by
+      // the same round.crashPoint via currentMultiplier()'s own Math.min.
+      await resolveAutoCashouts(roundRef, round, crashedAt)
+    } else {
+      await resolveAutoCashouts(roundRef, round, liveNow)
     }
   }
 
