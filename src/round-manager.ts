@@ -56,11 +56,17 @@ const CRASHED_DISPLAY_MS = 3_000
 // client's own multiplier display expects (or, worse, lets a client-side
 // display disagree with what a bet actually resolved against).
 //
-// Halved from the original (0.00016 / 0.0000000075) on 2026-08-22 to
-// slow the climb down. If you tune these again, update all three
-// locations: this file, the Vercel copy, and use-game-socket.ts.
+// GROWTH_ACCEL_PER_MS2 cut to 1/5 of the prior value (2026-08-22, same
+// day as the first halving). The quadratic term compounds on itself, so
+// at the old value the curve went from ~322x at 30s to the 1000x cap in
+// another ~3.6s -- fast enough that a cash-out's normal request latency
+// near a high multiplier could resolve several x away from what the
+// player saw on screen when they clicked. New timings: 2x ~8.1s,
+// 5x ~17.3s, 10x ~23.6s, 50x ~36.5s, 100x ~41.5s, 1000x cap ~56.5s.
+// If you tune these again, update all three locations: this file, the
+// Vercel copy, and use-game-socket.ts.
 const GROWTH_BASE_PER_MS = 0.00008
-const GROWTH_ACCEL_PER_MS2 = 0.00000000375
+const GROWTH_ACCEL_PER_MS2 = 0.00000000075
 
 const MAX_HISTORY = 50
 
