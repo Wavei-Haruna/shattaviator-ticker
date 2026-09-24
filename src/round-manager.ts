@@ -4,47 +4,83 @@ import {
   generateRoundSeed,
   RoundSeed,
 } from './crash.js'
-import { adminDb } from '../firebase-admin.js'
+import { adminDb } from './firebase-admin.js'
 import { broadcastState } from './ws-server.js'
 
 type Phase = 'waiting' | 'running' | 'crashed'
 
-interface Bet {
+export interface Bet {
   uid: string
   slotId: number
   amount: number
   autoCashoutAt: number | null
   cashedOutAt: number | null
-  payout: number | null
+  payout: number
 }
 
-interface RoundHistoryEntry {
-  roundNumber: number
-  crashPoint: number
-}
-
-interface RoundDoc {
+export interface RoundDoc {
   roundNumber: number
   phase: Phase
-  seed: RoundSeed
+  seed: string
   crashPoint: number
   startedAt: number | null
   nextRoundAt: number | null
   createdAt: number
 }
 
+export interface PublicState {
+  phase: Phase
+  roundNumber: number
+  serverSeedHash: string
+  multiplier: number
+  startedAt: number | null
+  serverTime: number
+  startsInMs: number
+  revealedSeed: string | null
+  crashPoint: number | null
+  history: number[]
+}
+
 const WAITING_MS = 8_000
 const CRASHED_DISPLAY_MS = 3_000
 
-/*
- * KEEP THESE IDENTICAL TO THE CLIENT AND VERCEL COPY.
- */
+const MAX_HISTORY = 50
+const MAX_SLOTS_PER_USER = 2
+
 const TIME_1_TO_10_MS = 30_000
 const TIME_10_TO_50_MS = 15_000
 const TIME_50_TO_100_MS = 5_000
+
 const MAX_CURVE_MULTIPLIER = 1000
 
-function multiplierFromElapsed(
+const RESYNC_EVERY_N_TICKS = 40
+const WAITING_BROADCAST_INTERVAL_MS = 1_000
+
+let cachedRound: RoundDoc | null = null
+let cachedRoundRef: string | null = null
+let ticksSinceResync = 0
+
+let historyCache: number[] = []
+
+let lastWaitingBroadcastAt = 0
+
+function roundRef(roundNumber: number): string {
+  return `round-${roundNumber}`
+}
+
+/**
+ * Multiplier pacing:
+ *
+ * 1x -> 10x   : 30 seconds
+ * 10x -> 50x  : 15 seconds
+ * 50x -> 100x : 5 seconds
+ * 100x+       : accelerates gradually
+ *
+ * IMPORTANT:
+ * Keep this exact function synchronized with the
+ * Vercel/API and client implementation.
+ */
+export function multiplierFromElapsed(
   elapsedMs: number,
   crashPoint: number | null,
 ): number {
@@ -54,10 +90,10 @@ function multiplierFromElapsed(
 
   if (elapsed <= TIME_1_TO_10_MS) {
     const progress = elapsed / TIME_1_TO_10_MS
+
     multiplier = 1 + progress * 9
   } else if (
-    elapsed <=
-    TIME_1_TO_10_MS + TIME_10_TO_50_MS
+    elapsed <= TIME_1_TO_10_MS + TIME_10_TO_50_MS
   ) {
     const segmentElapsed =
       elapsed - TIME_1_TO_10_MS
@@ -88,7 +124,8 @@ function multiplierFromElapsed(
       TIME_10_TO_50_MS -
       TIME_50_TO_100_MS
 
-    const extraProgress = segmentElapsed / 1_000
+    const extraProgress =
+      segmentElapsed / 1000
 
     multiplier =
       100 +
@@ -119,183 +156,354 @@ function currentMultiplier(
     return round.crashPoint
   }
 
-  if (round.startedAt === null) {
+  if (!round.startedAt) {
     return 1
   }
 
-  const elapsed = Math.max(
-    0,
-    now - round.startedAt,
-  )
-
   return multiplierFromElapsed(
-    elapsed,
+    now - round.startedAt,
     round.crashPoint,
   )
 }
 
-const MAX_HISTORY = 50
-const WAITING_BROADCAST_INTERVAL_MS = 1_000
-
-let lastWaitingBroadcastAt = 0
-
-const db: Firestore = adminDb
-const roundsCol = db.collection('rounds')
-const metaDoc = db.collection('meta').doc('currentRound')
-const counterDoc = db.collection('meta').doc('roundCounter')
-
-let cachedRound: RoundDoc | null = null
-let cachedRoundRef:
-  | FirebaseFirestore.DocumentReference
-  | null = null
-
-let ticksSinceResync = 0
-const RESYNC_EVERY_N_TICKS = 40
-
-let historyCache: RoundHistoryEntry[] = []
-
-function betId(uid: string, slotId: number) {
-  return `${uid}_${slotId}`
+function getServerSeedHash(seed: string): string {
+  return seed
 }
 
-async function ensureCurrentRound(): Promise<string> {
-  return db.runTransaction(async (tx) => {
-    const metaSnap = await tx.get(metaDoc)
+async function loadHistory(): Promise<number[]> {
+  try {
+    const snapshot = await adminDb
+      .collection('rounds')
+      .orderBy('roundNumber', 'desc')
+      .limit(MAX_HISTORY)
+      .get()
 
-    if (metaSnap.exists) {
-      return metaSnap.data()!.roundId as string
-    }
-
-    const counterSnap = await tx.get(counterDoc)
-
-    const nextNumber =
-      (counterSnap.exists
-        ? counterSnap.data()!.value
-        : Math.floor(Date.now() / 1000)) + 1
-
-    const seed = generateRoundSeed(nextNumber)
-    const crashPoint = computeCrashPoint(seed)
-    const now = Date.now()
-
-    const roundRef = roundsCol.doc(
-      String(nextNumber),
+    return snapshot.docs
+      .map((doc) => {
+        const data = doc.data() as RoundDoc
+        return Number(data.crashPoint)
+      })
+      .filter(
+        (value) =>
+          Number.isFinite(value) &&
+          value >= 1,
+      )
+  } catch (error) {
+    console.error(
+      '[ticker] Failed to load history:',
+      error,
     )
 
-    const doc: RoundDoc = {
-      roundNumber: nextNumber,
-      phase: 'waiting',
-      seed,
-      crashPoint,
-      startedAt: null,
-      nextRoundAt: now + WAITING_MS,
-      createdAt: now,
-    }
-
-    tx.set(roundRef, doc)
-    tx.set(counterDoc, {
-      value: nextNumber,
-    })
-    tx.set(metaDoc, {
-      roundId: roundRef.id,
-    })
-
-    return roundRef.id
-  })
+    return historyCache
+  }
 }
 
-async function loadRoundFromFirestore() {
-  const roundId =
-    await ensureCurrentRound()
+async function saveRound(
+  round: RoundDoc,
+): Promise<void> {
+  await adminDb
+    .collection('rounds')
+    .doc(roundRef(round.roundNumber))
+    .set(round, { merge: true })
+}
 
-  const roundRef = roundsCol.doc(roundId)
-  const snap = await roundRef.get()
+async function createWaitingRound(
+  roundNumber: number,
+): Promise<RoundDoc> {
+  const seedData: RoundSeed =
+    generateRoundSeed(roundNumber)
 
-  if (!snap.exists) {
-    throw new Error(
-      'Current round does not exist.',
+  const crashPoint = computeCrashPoint(
+    seedData,
+  )
+
+  const now = Date.now()
+
+  const round: RoundDoc = {
+    roundNumber,
+    phase: 'waiting',
+    seed: seedData.serverSeed,
+    crashPoint,
+    startedAt: null,
+    nextRoundAt: now + WAITING_MS,
+    createdAt: now,
+  }
+
+  await saveRound(round)
+
+  return round
+}
+
+/**
+ * Only creates a round if there is no current round.
+ *
+ * This does NOT start a running round.
+ */
+export async function ensureCurrentRound(): Promise<RoundDoc> {
+  const metaRef = adminDb
+    .collection('meta')
+    .doc('currentRound')
+
+  const snapshot = await metaRef.get()
+
+  if (snapshot.exists) {
+    const data = snapshot.data()
+
+    if (data?.roundNumber) {
+      const roundNumber = Number(
+        data.roundNumber,
+      )
+
+      const roundSnapshot = await adminDb
+        .collection('rounds')
+        .doc(roundRef(roundNumber))
+        .get()
+
+      if (roundSnapshot.exists) {
+        const round =
+          roundSnapshot.data() as RoundDoc
+
+        cachedRound = round
+        cachedRoundRef =
+          roundRef(round.roundNumber)
+
+        return round
+      }
+    }
+  }
+
+  const round = await createWaitingRound(1)
+
+  await metaRef.set({
+    roundNumber: round.roundNumber,
+    updatedAt: Date.now(),
+  })
+
+  cachedRound = round
+  cachedRoundRef =
+    roundRef(round.roundNumber)
+
+  historyCache = await loadHistory()
+
+  return round
+}
+
+/**
+ * Read-only current round lookup.
+ *
+ * This is important:
+ * Logging in or connecting to WebSocket does NOT
+ * create/start a new round.
+ */
+export async function getCurrentRound(): Promise<RoundDoc> {
+  if (cachedRound) {
+    return cachedRound
+  }
+
+  return ensureCurrentRound()
+}
+
+async function setCurrentRound(
+  round: RoundDoc,
+): Promise<void> {
+  await adminDb
+    .collection('meta')
+    .doc('currentRound')
+    .set({
+      roundNumber: round.roundNumber,
+      updatedAt: Date.now(),
+    })
+
+  cachedRound = round
+  cachedRoundRef =
+    roundRef(round.roundNumber)
+}
+
+async function startRound(
+  round: RoundDoc,
+  now: number,
+): Promise<RoundDoc> {
+  if (round.phase !== 'waiting') {
+    return round
+  }
+
+  const startedRound: RoundDoc = {
+    ...round,
+    phase: 'running',
+    startedAt: now,
+    nextRoundAt: null,
+  }
+
+  await saveRound(startedRound)
+  await setCurrentRound(startedRound)
+
+  console.log(
+    `[ticker] Round ${round.roundNumber} started at ${now}`,
+  )
+
+  return startedRound
+}
+
+async function crashRound(
+  round: RoundDoc,
+  now: number,
+): Promise<RoundDoc> {
+  if (round.phase !== 'running') {
+    return round
+  }
+
+  const crashedRound: RoundDoc = {
+    ...round,
+    phase: 'crashed',
+    nextRoundAt:
+      now + CRASHED_DISPLAY_MS,
+  }
+
+  await saveRound(crashedRound)
+  await setCurrentRound(crashedRound)
+
+  console.log(
+    `[ticker] Round ${round.roundNumber} crashed at ${round.crashPoint}x`,
+  )
+
+  historyCache = [
+    round.crashPoint,
+    ...historyCache,
+  ].slice(0, MAX_HISTORY)
+
+  return crashedRound
+}
+
+async function createNextRound(
+  previousRound: RoundDoc,
+): Promise<RoundDoc> {
+  const nextRoundNumber =
+    previousRound.roundNumber + 1
+
+  const nextRound =
+    await createWaitingRound(
+      nextRoundNumber,
+    )
+
+  await setCurrentRound(nextRound)
+
+  console.log(
+    `[ticker] Created round ${nextRoundNumber}`,
+  )
+
+  return nextRound
+}
+
+function getBetCollection(
+  roundNumber: number,
+) {
+  return adminDb
+    .collection('rounds')
+    .doc(roundRef(roundNumber))
+    .collection('bets')
+}
+
+async function resolveAutoCashouts(
+  round: RoundDoc,
+  multiplier: number,
+): Promise<void> {
+  if (round.phase !== 'running') {
+    return
+  }
+
+  const snapshot =
+    await getBetCollection(
+      round.roundNumber,
+    )
+      .where(
+        'cashedOutAt',
+        '==',
+        null,
+      )
+      .get()
+
+  if (snapshot.empty) {
+    return
+  }
+
+  const batch =
+    adminDb.batch()
+
+  let changed = false
+
+  for (const doc of snapshot.docs) {
+    const bet =
+      doc.data() as Bet
+
+    if (
+      bet.autoCashoutAt !== null &&
+      multiplier >=
+        bet.autoCashoutAt
+    ) {
+      const payout =
+        bet.amount *
+        bet.autoCashoutAt
+
+      batch.update(doc.ref, {
+        cashedOutAt:
+          Date.now(),
+        payout,
+      })
+
+      changed = true
+    }
+  }
+
+  if (changed) {
+    await batch.commit()
+  }
+}
+
+export function buildStatePayload(
+  round: RoundDoc,
+  now = Date.now(),
+): PublicState {
+  const multiplier =
+    currentMultiplier(
+      round,
+      now,
+    )
+
+  let startsInMs = 0
+
+  if (
+    round.phase === 'waiting' &&
+    round.nextRoundAt
+  ) {
+    startsInMs = Math.max(
+      0,
+      round.nextRoundAt - now,
     )
   }
 
-  cachedRoundRef = roundRef
-  cachedRound = snap.data() as RoundDoc
-
-  return cachedRound
-}
-
-async function refreshHistory() {
-  const snap = await roundsCol
-    .where('phase', '==', 'crashed')
-    .orderBy('roundNumber', 'desc')
-    .limit(MAX_HISTORY)
-    .get()
-
-  historyCache = snap.docs.map((d) => {
-    const data = d.data() as RoundDoc
-
-    return {
-      roundNumber: data.roundNumber,
-      crashPoint: data.crashPoint,
-    }
-  })
-}
-
-function multiplierColor(
-  value: number,
-): 'blue' | 'purple' | 'pink' {
-  if (value < 2) return 'blue'
-  if (value < 10) return 'purple'
-  return 'pink'
-}
-
-function buildStatePayload(
-  round: RoundDoc,
-) {
-  const now = Date.now()
-
   return {
-    type: 'state',
-
     phase: round.phase,
 
-    roundNumber: round.roundNumber,
+    roundNumber:
+      round.roundNumber,
 
     serverSeedHash:
-      round.seed.serverSeedHash,
+      getServerSeedHash(
+        round.seed,
+      ),
 
-    multiplier: Number(
-      currentMultiplier(
-        round,
-        now,
-      ).toFixed(2),
-    ),
+    multiplier,
 
-    /*
-     * This is the original server timestamp.
-     * It NEVER changes when a client connects.
-     */
     startedAt:
-      round.phase === 'running'
-        ? round.startedAt
-        : null,
+      round.startedAt,
 
-    /*
-     * Client uses this to calculate:
-     *
-     * serverNow = Date.now() + offset
-     */
     serverTime: now,
 
-    startsInMs:
-      round.phase === 'waiting'
-        ? Math.max(
-            0,
-            (round.nextRoundAt ?? now) - now,
-          )
-        : null,
+    startsInMs,
 
     revealedSeed:
       round.phase === 'crashed'
-        ? round.seed.serverSeed
+        ? round.seed
         : null,
 
     crashPoint:
@@ -303,404 +511,350 @@ function buildStatePayload(
         ? round.crashPoint
         : null,
 
-    history: historyCache.map((h) => ({
-      roundNumber: h.roundNumber,
-      value: h.crashPoint,
-      color: multiplierColor(
-        h.crashPoint,
-      ),
-    })),
+    history:
+      historyCache,
   }
 }
 
 async function broadcast(
   round: RoundDoc,
-) {
-  broadcastState(
-    buildStatePayload(round),
-  )
+): Promise<void> {
+  const state =
+    buildStatePayload(
+      round,
+      Date.now(),
+    )
+
+  broadcastState(state as unknown as Record<string, unknown>)
 }
 
-async function resolveAutoCashouts(
-  roundRef: FirebaseFirestore.DocumentReference,
-  round: RoundDoc,
-  now: number,
-) {
-  if (round.phase !== 'running') {
-    return
+async function refreshCachedRound(): Promise<RoundDoc> {
+  const round =
+    await getCurrentRound()
+
+  cachedRound = round
+  cachedRoundRef =
+    roundRef(round.roundNumber)
+
+  return round
+}
+
+/**
+ * Main authoritative server ticker.
+ *
+ * Railway is the only service allowed to transition
+ * rounds through waiting -> running -> crashed.
+ */
+export async function tick(): Promise<void> {
+  const now = Date.now()
+
+  let round: RoundDoc
+
+  if (
+    !cachedRound ||
+    ticksSinceResync >=
+      RESYNC_EVERY_N_TICKS
+  ) {
+    round =
+      await refreshCachedRound()
+
+    ticksSinceResync = 0
+  } else {
+    round = cachedRound
   }
 
-  const live = currentMultiplier(
-    round,
-    now,
-  )
+  ticksSinceResync += 1
 
-  const dueSnap = await roundRef
-    .collection('bets')
-    .where('cashedOutAt', '==', null)
-    .where(
-      'autoCashoutAt',
-      '<=',
-      live,
-    )
-    .get()
+  if (round.phase === 'waiting') {
+    if (
+      round.nextRoundAt !== null &&
+      now >= round.nextRoundAt
+    ) {
+      round =
+        await startRound(
+          round,
+          now,
+        )
 
-  if (dueSnap.empty) {
-    return
-  }
+      await broadcast(round)
 
-  const batch = db.batch()
-
-  dueSnap.forEach((doc) => {
-    const bet = doc.data() as Bet
-
-    if (bet.autoCashoutAt === null) {
       return
     }
 
-    const autoCashoutAt =
-      bet.autoCashoutAt
+    if (
+      now -
+        lastWaitingBroadcastAt >=
+      WAITING_BROADCAST_INTERVAL_MS
+    ) {
+      lastWaitingBroadcastAt = now
 
-    const payout =
-      Math.floor(
-        bet.amount *
-          autoCashoutAt *
-          100,
-      ) / 100
+      await broadcast(round)
+    }
 
-    batch.update(doc.ref, {
-      cashedOutAt:
-        autoCashoutAt,
-      payout,
-    })
-  })
-
-  await batch.commit()
-}
-
-export async function tick(): Promise<RoundDoc> {
-  /*
-   * Initial load.
-   */
-  if (
-    cachedRound === null ||
-    cachedRoundRef === null
-  ) {
-    await loadRoundFromFirestore()
+    return
   }
 
-  /*
-   * Periodic authoritative resync.
-   */
-  ticksSinceResync++
-
-  if (
-    ticksSinceResync >=
-    RESYNC_EVERY_N_TICKS
-  ) {
-    ticksSinceResync = 0
-    await loadRoundFromFirestore()
-  }
-
-  if (
-    cachedRound === null ||
-    cachedRoundRef === null
-  ) {
-    throw new Error(
-      'Round cache unavailable.',
-    )
-  }
-
-  let round = cachedRound
-  let roundRef = cachedRoundRef
-
-  const now = Date.now()
-
-  /*
-   * WAITING -> RUNNING
-   */
-  if (
-    round.phase === 'waiting' &&
-    round.nextRoundAt !== null &&
-    now >= round.nextRoundAt
-  ) {
-    await db.runTransaction(async (tx) => {
-      const fresh =
-        await tx.get(roundRef)
-
-      if (!fresh.exists) {
-        return
-      }
-
-      const data =
-        fresh.data() as RoundDoc
-
-      if (
-        data.phase !== 'waiting'
-      ) {
-        return
-      }
-
-      /*
-       * This timestamp is the actual
-       * beginning of the round.
-       *
-       * It is NOT based on any client.
-       */
-      const startedAt =
-        Date.now()
-
-      tx.update(roundRef, {
-        phase: 'running',
-        startedAt,
-        nextRoundAt: null,
-      })
-    })
-
-    await loadRoundFromFirestore()
-
-    round = cachedRound!
-    roundRef = cachedRoundRef!
-
-    await broadcast(round)
-  }
-
-  /*
-   * RUNNING
-   */
   if (round.phase === 'running') {
-    const liveNow = Date.now()
+    if (!round.startedAt) {
+      return
+    }
 
     const multiplier =
       currentMultiplier(
         round,
-        liveNow,
+        now,
       )
 
-    /*
-     * Crash first.
+    /**
+     * Check crash BEFORE auto cashouts.
+     *
+     * Once the authoritative crash point has
+     * been reached, the round is crashed.
      */
     if (
       multiplier >=
       round.crashPoint
     ) {
-      const crashedAt =
-        Date.now()
-
-      await db.runTransaction(
-        async (tx) => {
-          const fresh =
-            await tx.get(roundRef)
-
-          if (!fresh.exists) {
-            return
-          }
-
-          const data =
-            fresh.data() as RoundDoc
-
-          if (
-            data.phase !==
-            'running'
-          ) {
-            return
-          }
-
-          tx.update(roundRef, {
-            phase: 'crashed',
-            nextRoundAt:
-              crashedAt +
-              CRASHED_DISPLAY_MS,
-          })
-        },
-      )
-
-      await loadRoundFromFirestore()
-
-      round = cachedRound!
-      roundRef = cachedRoundRef!
-
-      await refreshHistory()
+      round =
+        await crashRound(
+          round,
+          now,
+        )
 
       await broadcast(round)
 
-      await resolveAutoCashouts(
-        roundRef,
-        round,
-        crashedAt,
-      )
-    } else {
-      await resolveAutoCashouts(
-        roundRef,
-        round,
-        liveNow,
-      )
+      return
     }
+
+    await resolveAutoCashouts(
+      round,
+      multiplier,
+    )
+
+    await broadcast(round)
+
+    return
   }
 
-  /*
-   * CRASHED -> WAITING
-   */
-  if (
-    round.phase === 'crashed' &&
-    round.nextRoundAt !== null &&
-    Date.now() >=
-      round.nextRoundAt
-  ) {
-    const oldRoundId =
-      roundRef.id
+  if (round.phase === 'crashed') {
+    if (
+      round.nextRoundAt !== null &&
+      now >= round.nextRoundAt
+    ) {
+      round =
+        await createNextRound(
+          round,
+        )
 
-    const newRoundId =
-      await db.runTransaction(
-        async (tx) => {
-          const metaSnap =
-            await tx.get(
-              metaDoc,
-            )
+      await broadcast(round)
 
-          if (
-            !metaSnap.exists
-          ) {
-            throw new Error(
-              'Current round metadata missing.',
-            )
-          }
-
-          if (
-            metaSnap.data()!
-              .roundId !==
-            oldRoundId
-          ) {
-            return metaSnap.data()!
-              .roundId as string
-          }
-
-          const counterSnap =
-            await tx.get(
-              counterDoc,
-            )
-
-          const nextNumber =
-            (counterSnap.data()!
-              .value as number) +
-            1
-
-          const seed =
-            generateRoundSeed(
-              nextNumber,
-            )
-
-          const crashPoint =
-            computeCrashPoint(
-              seed,
-            )
-
-          const start =
-            Date.now()
-
-          const newRef =
-            roundsCol.doc(
-              String(nextNumber),
-            )
-
-          const doc: RoundDoc = {
-            roundNumber:
-              nextNumber,
-            phase: 'waiting',
-            seed,
-            crashPoint,
-            startedAt: null,
-            nextRoundAt:
-              start +
-              WAITING_MS,
-            createdAt: start,
-          }
-
-          tx.set(
-            newRef,
-            doc,
-          )
-
-          tx.set(
-            counterDoc,
-            {
-              value:
-                nextNumber,
-            },
-          )
-
-          tx.set(
-            metaDoc,
-            {
-              roundId:
-                newRef.id,
-            },
-          )
-
-          return newRef.id
-        },
-      )
-
-    roundRef =
-      roundsCol.doc(
-        newRoundId,
-      )
-
-    const snap =
-      await roundRef.get()
-
-    if (!snap.exists) {
-      throw new Error(
-        'New round was not created.',
-      )
+      return
     }
-
-    round =
-      snap.data() as RoundDoc
-
-    cachedRound =
-      round
-
-    cachedRoundRef =
-      roundRef
 
     await broadcast(round)
   }
-
-  /*
-   * WAITING countdown.
-   *
-   * Broadcast approximately once per second.
-   */
-  if (
-    round.phase === 'waiting'
-  ) {
-    const nowWaiting =
-      Date.now()
-
-    if (
-      nowWaiting -
-        lastWaitingBroadcastAt >=
-      WAITING_BROADCAST_INTERVAL_MS
-    ) {
-      lastWaitingBroadcastAt =
-        nowWaiting
-
-      await broadcast(round)
-    }
-  }
-
-  return round
 }
 
-export async function getRoundHistory(): Promise<
-  RoundHistoryEntry[]
-> {
+/**
+ * Server-authoritative cash out.
+ *
+ * The client never decides the payout multiplier.
+ */
+export async function cashOut(
+  roundNumber: number,
+  uid: string,
+  slotId: number,
+): Promise<{
+  success: boolean
+  multiplier: number
+  payout: number
+}> {
+  const round =
+    await getCurrentRound()
+
   if (
-    historyCache.length === 0
+    round.roundNumber !==
+    roundNumber
   ) {
-    await refreshHistory()
+    throw new Error(
+      'Round is no longer active',
+    )
   }
 
-  return historyCache
+  if (round.phase !== 'running') {
+    throw new Error(
+      'Round is not running',
+    )
+  }
+
+  const now = Date.now()
+
+  const multiplier =
+    currentMultiplier(
+      round,
+      now,
+    )
+
+  if (
+    multiplier >=
+    round.crashPoint
+  ) {
+    throw new Error(
+      'Round already crashed',
+    )
+  }
+
+  const betRef =
+    getBetCollection(
+      round.roundNumber,
+    ).doc(
+      `${uid}-${slotId}`,
+    )
+
+  const result =
+    await adminDb.runTransaction(
+      async (transaction) => {
+        const snapshot =
+          await transaction.get(
+            betRef,
+          )
+
+        if (!snapshot.exists) {
+          throw new Error(
+            'Bet not found',
+          )
+        }
+
+        const bet =
+          snapshot.data() as Bet
+
+        if (
+          bet.uid !== uid ||
+          bet.slotId !== slotId
+        ) {
+          throw new Error(
+            'Invalid bet',
+          )
+        }
+
+        if (
+          bet.cashedOutAt !==
+          null
+        ) {
+          throw new Error(
+            'Already cashed out',
+          )
+        }
+
+        const payout =
+          bet.amount *
+          multiplier
+
+        transaction.update(
+          betRef,
+          {
+            cashedOutAt: now,
+            payout,
+          },
+        )
+
+        return {
+          success: true,
+          multiplier,
+          payout,
+        }
+      },
+    )
+
+  return result
+}
+
+/**
+ * Places a bet only during the waiting phase.
+ *
+ * Authentication/authorization should be handled
+ * by the API layer before calling this function.
+ */
+export async function placeBet(
+  uid: string,
+  slotId: number,
+  amount: number,
+  autoCashoutAt:
+    | number
+    | null,
+): Promise<Bet> {
+  if (
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    throw new Error(
+      'Invalid bet amount',
+    )
+  }
+
+  if (
+    !Number.isInteger(slotId) ||
+    slotId < 0 ||
+    slotId >= MAX_SLOTS_PER_USER
+  ) {
+    throw new Error(
+      'Invalid slot',
+    )
+  }
+
+  if (
+    autoCashoutAt !== null &&
+    (!Number.isFinite(
+      autoCashoutAt,
+    ) ||
+      autoCashoutAt <= 1)
+  ) {
+    throw new Error(
+      'Invalid auto cashout',
+    )
+  }
+
+  const round =
+    await getCurrentRound()
+
+  if (round.phase !== 'waiting') {
+    throw new Error(
+      'Bets are closed',
+    )
+  }
+
+  const betRef =
+    getBetCollection(
+      round.roundNumber,
+    ).doc(
+      `${uid}-${slotId}`,
+    )
+
+  const bet: Bet = {
+    uid,
+    slotId,
+    amount,
+    autoCashoutAt,
+    cashedOutAt: null,
+    payout: 0,
+  }
+
+  await betRef.set(bet)
+
+  return bet
+}
+
+/**
+ * Returns the current public game state.
+ *
+ * This is read-only and cannot start a round.
+ */
+export async function getPublicState(): Promise<PublicState> {
+  const round =
+    await getCurrentRound()
+
+  return buildStatePayload(
+    round,
+    Date.now(),
+  )
 }
