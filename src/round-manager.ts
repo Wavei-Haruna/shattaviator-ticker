@@ -1,4 +1,3 @@
-import { Firestore } from 'firebase-admin/firestore'
 import {
   computeCrashPoint,
   generateRoundSeed,
@@ -47,9 +46,21 @@ const CRASHED_DISPLAY_MS = 3_000
 const MAX_HISTORY = 50
 const MAX_SLOTS_PER_USER = 2
 
-const TIME_1_TO_10_MS = 30_000
-const TIME_10_TO_50_MS = 15_000
-const TIME_50_TO_100_MS = 5_000
+/*
+ * Piecewise multiplier curve.
+ *
+ * 1x -> 10x   : 40 seconds
+ * 10x -> 50x  : 25 seconds
+ * 50x -> 100x : 10 seconds
+ * 100x+       : slower acceleration
+ *
+ * IMPORTANT:
+ * This exact curve must stay synchronized with
+ * the Vercel/API and client implementation.
+ */
+const TIME_1_TO_10_MS = 40_000
+const TIME_10_TO_50_MS = 25_000
+const TIME_50_TO_100_MS = 10_000
 
 const MAX_CURVE_MULTIPLIER = 1000
 
@@ -68,18 +79,6 @@ function roundRef(roundNumber: number): string {
   return `round-${roundNumber}`
 }
 
-/**
- * Multiplier pacing:
- *
- * 1x -> 10x   : 30 seconds
- * 10x -> 50x  : 15 seconds
- * 50x -> 100x : 5 seconds
- * 100x+       : accelerates gradually
- *
- * IMPORTANT:
- * Keep this exact function synchronized with the
- * Vercel/API and client implementation.
- */
 export function multiplierFromElapsed(
   elapsedMs: number,
   crashPoint: number | null,
@@ -88,21 +87,41 @@ export function multiplierFromElapsed(
 
   let multiplier: number
 
+  /*
+   * 1x -> 10x over 40 seconds
+   */
   if (elapsed <= TIME_1_TO_10_MS) {
-    const progress = elapsed / TIME_1_TO_10_MS
+    const progress =
+      elapsed / TIME_1_TO_10_MS
 
-    multiplier = 1 + progress * 9
-  } else if (
-    elapsed <= TIME_1_TO_10_MS + TIME_10_TO_50_MS
+    multiplier =
+      1 + progress * 9
+  }
+
+  /*
+   * 10x -> 50x over 25 seconds
+   */
+  else if (
+    elapsed <=
+    TIME_1_TO_10_MS +
+      TIME_10_TO_50_MS
   ) {
     const segmentElapsed =
-      elapsed - TIME_1_TO_10_MS
+      elapsed -
+      TIME_1_TO_10_MS
 
     const progress =
-      segmentElapsed / TIME_10_TO_50_MS
+      segmentElapsed /
+      TIME_10_TO_50_MS
 
-    multiplier = 10 + progress * 40
-  } else if (
+    multiplier =
+      10 + progress * 40
+  }
+
+  /*
+   * 50x -> 100x over 10 seconds
+   */
+  else if (
     elapsed <=
     TIME_1_TO_10_MS +
       TIME_10_TO_50_MS +
@@ -114,10 +133,19 @@ export function multiplierFromElapsed(
       TIME_10_TO_50_MS
 
     const progress =
-      segmentElapsed / TIME_50_TO_100_MS
+      segmentElapsed /
+      TIME_50_TO_100_MS
 
-    multiplier = 50 + progress * 50
-  } else {
+    multiplier =
+      50 + progress * 50
+  }
+
+  /*
+   * 100x+:
+   *
+   * Slower acceleration than the previous curve.
+   */
+  else {
     const segmentElapsed =
       elapsed -
       TIME_1_TO_10_MS -
@@ -125,11 +153,15 @@ export function multiplierFromElapsed(
       TIME_50_TO_100_MS
 
     const extraProgress =
-      segmentElapsed / 1000
+      segmentElapsed / 1_000
 
     multiplier =
       100 +
-      Math.pow(extraProgress, 1.35) * 25
+      Math.pow(
+        extraProgress,
+        1.2,
+      ) *
+        20
   }
 
   const capped = Math.min(
@@ -138,7 +170,10 @@ export function multiplierFromElapsed(
   )
 
   if (crashPoint !== null) {
-    return Math.min(capped, crashPoint)
+    return Math.min(
+      capped,
+      crashPoint,
+    )
   }
 
   return capped
@@ -234,11 +269,6 @@ async function createWaitingRound(
   return round
 }
 
-/**
- * Only creates a round if there is no current round.
- *
- * This does NOT start a running round.
- */
 export async function ensureCurrentRound(): Promise<RoundDoc> {
   const metaRef = adminDb
     .collection('meta')
@@ -288,13 +318,6 @@ export async function ensureCurrentRound(): Promise<RoundDoc> {
   return round
 }
 
-/**
- * Read-only current round lookup.
- *
- * This is important:
- * Logging in or connecting to WebSocket does NOT
- * create/start a new round.
- */
 export async function getCurrentRound(): Promise<RoundDoc> {
   if (cachedRound) {
     return cachedRound
@@ -525,7 +548,9 @@ async function broadcast(
       Date.now(),
     )
 
-  broadcastState(state as unknown as Record<string, unknown>)
+  broadcastState(
+    state as unknown as Record<string, unknown>,
+  )
 }
 
 async function refreshCachedRound(): Promise<RoundDoc> {
@@ -539,12 +564,6 @@ async function refreshCachedRound(): Promise<RoundDoc> {
   return round
 }
 
-/**
- * Main authoritative server ticker.
- *
- * Railway is the only service allowed to transition
- * rounds through waiting -> running -> crashed.
- */
 export async function tick(): Promise<void> {
   const now = Date.now()
 
@@ -605,12 +624,6 @@ export async function tick(): Promise<void> {
         now,
       )
 
-    /**
-     * Check crash BEFORE auto cashouts.
-     *
-     * Once the authoritative crash point has
-     * been reached, the round is crashed.
-     */
     if (
       multiplier >=
       round.crashPoint
@@ -655,11 +668,6 @@ export async function tick(): Promise<void> {
   }
 }
 
-/**
- * Server-authoritative cash out.
- *
- * The client never decides the payout multiplier.
- */
 export async function cashOut(
   roundNumber: number,
   uid: string,
@@ -769,12 +777,6 @@ export async function cashOut(
   return result
 }
 
-/**
- * Places a bet only during the waiting phase.
- *
- * Authentication/authorization should be handled
- * by the API layer before calling this function.
- */
 export async function placeBet(
   uid: string,
   slotId: number,
@@ -844,11 +846,6 @@ export async function placeBet(
   return bet
 }
 
-/**
- * Returns the current public game state.
- *
- * This is read-only and cannot start a round.
- */
 export async function getPublicState(): Promise<PublicState> {
   const round =
     await getCurrentRound()
